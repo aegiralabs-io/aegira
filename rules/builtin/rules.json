@@ -1,0 +1,34 @@
+[
+  {
+    "id": "connection_refused",
+    "name": "Connection Refused",
+    "severity": "high",
+    "error_patterns": ["connection refused"],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "connection_reset",
+    "name": "Connection Reset",
+    "severity": "high",
+    "error_patterns": ["connection reset"],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  }
+]
