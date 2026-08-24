@@ -1,0 +1,4 @@
+target/
+*.log
+config/aegira.env
+.env
