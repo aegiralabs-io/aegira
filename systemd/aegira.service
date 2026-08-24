@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=pikachu
-WorkingDirectory=/home/pikachu/aegira
-EnvironmentFile=/home/pikachu/aegira/config/aegira.env
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/aegira
+EnvironmentFile=/home/YOUR_USERNAME/aegira/config/aegira.env
 ExecStart=/usr/local/bin/aegira
 Restart=always
 RestartSec=3
