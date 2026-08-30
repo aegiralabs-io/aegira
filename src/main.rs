@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -7,23 +7,90 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-const LOGS_DIR: &str = "/var/log/aegira";
-const LOG_FILE_PATH: &str = "/var/log/aegira/system.log";
-const INCIDENT_LOG_PATH: &str = "/var/log/aegira/incident.log";
-
-const BUILTIN_RULES_DIR: &str = "/etc/aegira/rules/builtin";
-const CUSTOM_RULES_DIR: &str = "/etc/aegira/rules/custom";
-
 const POLL_INTERVAL_SECS: u64 = 2;
-const RULE_RELOAD_INTERVAL_SECS: u64 = 10;
 const COMMAND_TIMEOUT_SECS: u64 = 20;
-const VERIFY_DELAY_SECS: u64 = 2;
-const MAX_VERIFY_ATTEMPTS: u32 = 5;
-const INCIDENT_COOLDOWN_SECS: u64 = 30;
-const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
-
 const MIN_MATCH_SCORE: i32 = 60;
-const SELF_SERVICE: &str = "aegira";
+const SELF_SERVICE: &str = "aegira.service";
+
+/* ============================================================
+   PATH RESOLUTION
+============================================================ */
+
+fn get_aegira_dir() -> PathBuf {
+    if let Ok(cwd) = env::current_dir() {
+        if cwd.ends_with("aegira") {
+            return cwd;
+        }
+    }
+
+    let home_dir = env::var("HOME")
+        .unwrap_or_else(|_| "/root".to_string());
+
+    PathBuf::from(home_dir).join("aegira")
+}
+
+fn get_log_file_path() -> PathBuf {
+    let aegira_dir = get_aegira_dir();
+
+    let logs_dir_file = aegira_dir
+        .join("logs")
+        .join("system.log");
+
+    if !logs_dir_file.exists() {
+        let root_system_log = aegira_dir
+            .join("system.log");
+
+        if root_system_log.exists() {
+            return root_system_log;
+        }
+    }
+
+    logs_dir_file
+}
+
+fn get_incident_log_path() -> PathBuf {
+    get_aegira_dir()
+        .join("logs")
+        .join("incident.log")
+}
+
+fn get_builtin_rules_dir() -> PathBuf {
+    get_aegira_dir()
+        .join("rules")
+        .join("builtin")
+}
+
+fn get_custom_rules_dir() -> PathBuf {
+    get_aegira_dir()
+        .join("rules")
+        .join("custom")
+}
+
+/* ============================================================
+   LOGGING
+============================================================ */
+
+fn log_incident(msg: &str) {
+    println!("{}", msg);
+
+    let incident_log_path = get_incident_log_path();
+
+    if let Some(parent) = incident_log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(incident_log_path)
+    {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
+
+/* ============================================================
+   RULE STRUCTURES
+============================================================ */
 
 #[derive(Debug, Deserialize, Clone)]
 struct Rule {
@@ -51,237 +118,43 @@ struct Rule {
 #[serde(tag = "type")]
 enum Remediation {
     #[serde(rename = "service_restart")]
-    ServiceRestart { service: String },
+    ServiceRestart {
+        service: String,
+    },
 
     #[serde(rename = "container_restart")]
-    ContainerRestart { container: String },
+    ContainerRestart {
+        container: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 enum Verification {
     #[serde(rename = "service_active")]
-    ServiceActive { service: String },
+    ServiceActive {
+        service: String,
+    },
 
     #[serde(rename = "container_running")]
-    ContainerRunning { container: String },
-
-    #[serde(rename = "none")]
-    None,
+    ContainerRunning {
+        container: String,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+/* ============================================================
+   RULE LOADING
+============================================================ */
 
-fn get_aegira_dir() -> PathBuf {
-    PathBuf::from("/etc/aegira")
-}
-
-fn ensure_file_exists(path: &Path) -> Result<(), String> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(|_| ())
-        .map_err(|e| {
-            format!(
-                "Failed to create {}: {}",
-                path.display(),
-                e
-            )
-        })
-}
-
-fn ensure_environment_setup() -> Result<(), String> {
-    fs::create_dir_all(LOGS_DIR)
-        .map_err(|e| {
-            format!(
-                "Failed to create {}: {}",
-                LOGS_DIR,
-                e
-            )
-        })?;
-
-    fs::create_dir_all(BUILTIN_RULES_DIR)
-        .map_err(|e| {
-            format!(
-                "Failed to create {}: {}",
-                BUILTIN_RULES_DIR,
-                e
-            )
-        })?;
-
-    fs::create_dir_all(CUSTOM_RULES_DIR)
-        .map_err(|e| {
-            format!(
-                "Failed to create {}: {}",
-                CUSTOM_RULES_DIR,
-                e
-            )
-        })?;
-
-    ensure_file_exists(Path::new(LOG_FILE_PATH))?;
-    ensure_file_exists(Path::new(INCIDENT_LOG_PATH))?;
-
-    Ok(())
-}
-
-fn rotate_incident_log_if_needed() {
-    let path = Path::new(INCIDENT_LOG_PATH);
-
-    let size = match fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(_) => return,
-    };
-
-    if size < MAX_INCIDENT_LOG_BYTES {
-        return;
-    }
-
-    let rotated =
-        Path::new(LOGS_DIR).join("incident.log.1");
-
-    let _ = fs::remove_file(&rotated);
-
-    if let Err(e) = fs::rename(path, &rotated) {
-        eprintln!(
-            "[LOG ERROR] Failed to rotate incident log: {}",
-            e
-        );
-        return;
-    }
-
-    let _ = ensure_file_exists(path);
-}
-
-fn log_incident(msg: &str) {
-    println!("{}", msg);
-
-    rotate_incident_log_if_needed();
-
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(INCIDENT_LOG_PATH)
-    {
-        let _ = writeln!(file, "{}", msg);
-    }
-}
-
-fn validate_rule(rule: &Rule) -> Result<(), String> {
-    if rule.id.trim().is_empty() {
-        return Err(
-            "Rule ID cannot be empty".to_string()
-        );
-    }
-
-    if rule.name.trim().is_empty() {
-        return Err(format!(
-            "Rule '{}' has an empty name",
-            rule.id
-        ));
-    }
-
-    if rule.error_patterns.is_empty() {
-        return Err(format!(
-            "Rule '{}' has no error patterns",
-            rule.id
-        ));
-    }
-
-    for pattern in &rule.error_patterns {
-        if pattern.trim().is_empty() {
-            return Err(format!(
-                "Rule '{}' contains an empty error pattern",
-                rule.id
-            ));
-        }
-    }
-
-    match &rule.remediation {
-        Remediation::ServiceRestart { service } => {
-            if service.trim().is_empty() {
-                return Err(format!(
-                    "Rule '{}' has an empty service",
-                    rule.id
-                ));
-            }
-
-            let normalized =
-                service
-                    .trim()
-                    .trim_end_matches(".service")
-                    .to_lowercase();
-
-            if normalized == SELF_SERVICE {
-                return Err(format!(
-                    "Rule '{}' attempts to restart Aegira itself",
-                    rule.id
-                ));
-            }
-        }
-
-        Remediation::ContainerRestart { container } => {
-            if container.trim().is_empty() {
-                return Err(format!(
-                    "Rule '{}' has an empty container",
-                    rule.id
-                ));
-            }
-        }
-    }
-
-    match &rule.verification {
-        Verification::ServiceActive { service } => {
-            if service.trim().is_empty() {
-                return Err(format!(
-                    "Rule '{}' has an empty verification service",
-                    rule.id
-                ));
-            }
-        }
-
-        Verification::ContainerRunning { container } => {
-            if container.trim().is_empty() {
-                return Err(format!(
-                    "Rule '{}' has an empty verification container",
-                    rule.id
-                ));
-            }
-        }
-
-        Verification::None => {}
-    }
-
-    Ok(())
-}
-
-fn parse_rules(contents: &str) -> Result<Vec<Rule>, String> {
-    let contents = contents.trim();
-
-    if contents.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if contents.starts_with('[') {
-        serde_json::from_str::<Vec<Rule>>(contents)
-            .map_err(|e| e.to_string())
-    } else {
-        serde_json::from_str::<Rule>(contents)
-            .map(|rule| vec![rule])
-            .map_err(|e| e.to_string())
-    }
-}
-
-fn load_rules_from_directory(
-    path: &Path,
-) -> Vec<Rule> {
+fn load_rules_from_directory(path: &Path) -> Vec<Rule> {
     let mut rules = Vec::new();
 
     if !path.exists() {
+        log_incident(&format!(
+            "[RULES] Directory does not exist: {}",
+            path.display()
+        ));
+
         return rules;
     }
 
@@ -299,52 +172,66 @@ fn load_rules_from_directory(
         }
     };
 
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|value| value.to_str())
-                == Some("json")
-        })
-        .collect();
+    for entry in entries.flatten() {
+        let file_path = entry.path();
 
-    files.sort();
+        if file_path.extension()
+            .and_then(|x| x.to_str())
+            != Some("json")
+        {
+            continue;
+        }
 
-    for file_path in files {
-        let contents =
-            match fs::read_to_string(&file_path) {
-                Ok(contents) => contents,
+        let contents = match fs::read_to_string(&file_path) {
+            Ok(contents) => contents,
 
-                Err(e) => {
-                    log_incident(&format!(
-                        "[RULES ERROR] Failed reading {}: {}",
-                        file_path.display(),
-                        e
-                    ));
+            Err(e) => {
+                log_incident(&format!(
+                    "[RULES ERROR] Failed reading {}: {}",
+                    file_path.display(),
+                    e
+                ));
 
-                    continue;
-                }
-            };
+                continue;
+            }
+        };
 
-        let parsed =
-            match parse_rules(&contents) {
-                Ok(rules) => rules,
+        /*
+         * Support BOTH formats:
+         *
+         * Single rule:
+         * {
+         *   "id": "...",
+         *   ...
+         * }
+         *
+         * Multiple rules:
+         * [
+         *   {
+         *     "id": "...",
+         *     ...
+         *   },
+         *   {
+         *     "id": "...",
+         *     ...
+         *   }
+         * ]
+         */
 
-                Err(e) => {
-                    log_incident(&format!(
-                        "[RULES ERROR] Invalid JSON {}: {}",
-                        file_path.display(),
-                        e
-                    ));
+        if let Ok(rule) = serde_json::from_str::<Rule>(&contents) {
+            log_incident(&format!(
+                "[RULES] Loaded: {}",
+                rule.id
+            ));
 
-                    continue;
-                }
-            };
+            rules.push(rule);
 
-        for rule in parsed {
-            match validate_rule(&rule) {
-                Ok(()) => {
+            continue;
+        }
+
+        match serde_json::from_str::<Vec<Rule>>(&contents) {
+            Ok(loaded_rules) => {
+                for rule in loaded_rules {
                     log_incident(&format!(
                         "[RULES] Loaded: {}",
                         rule.id
@@ -352,13 +239,14 @@ fn load_rules_from_directory(
 
                     rules.push(rule);
                 }
+            }
 
-                Err(e) => {
-                    log_incident(&format!(
-                        "[RULES ERROR] {}",
-                        e
-                    ));
-                }
+            Err(e) => {
+                log_incident(&format!(
+                    "[RULES ERROR] Invalid rule file {}: {}",
+                    file_path.display(),
+                    e
+                ));
             }
         }
     }
@@ -366,78 +254,66 @@ fn load_rules_from_directory(
     rules
 }
 
-fn get_hardcoded_default_rules() -> Vec<Rule> {
-    vec![Rule {
-        id: "connection_refused".to_string(),
-        name: "Connection Refused".to_string(),
-        severity: "high".to_string(),
+fn check_custom_rules() {
+    let custom_rules_dir = get_custom_rules_dir();
 
-        error_patterns: vec![
-            "connection refused".to_string(),
-        ],
+    if !custom_rules_dir.exists() {
+        return;
+    }
 
-        context_patterns: Vec::new(),
+    let entries = match fs::read_dir(&custom_rules_dir) {
+        Ok(entries) => entries,
 
-        remediation: Remediation::ServiceRestart {
-            service: "cron".to_string(),
-        },
+        Err(e) => {
+            log_incident(&format!(
+                "[RULES ERROR] Failed checking custom rules: {}",
+                e
+            ));
 
-        verification: Verification::ServiceActive {
-            service: "cron".to_string(),
-        },
+            return;
+        }
+    };
 
-        priority: 10,
-    }]
+    let mut custom_rule_found = false;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.extension()
+            .and_then(|x| x.to_str())
+            == Some("json")
+        {
+            custom_rule_found = true;
+            break;
+        }
+    }
+
+    if custom_rule_found {
+        log_incident(
+            "[UPGRADE REQUIRED] Custom rules detected but are not available in Aegira Free"
+        );
+
+        log_incident(
+            "[UPGRADE REQUIRED] Upgrade to Aegira Paid to enable custom remediation rules"
+        );
+    }
 }
 
 fn load_all_rules() -> Vec<Rule> {
-    let mut rules = Vec::new();
-    let mut seen_ids = HashSet::new();
+    log_incident("[RULES] Loading built-in rules...");
 
-    let builtin_dir =
-        Path::new(BUILTIN_RULES_DIR);
+    let builtin_rules_dir = get_builtin_rules_dir();
 
-    let builtin =
-        load_rules_from_directory(builtin_dir);
+    let rules = load_rules_from_directory(
+        &builtin_rules_dir
+    );
 
-    for rule in builtin {
-        let id = rule.id.trim().to_lowercase();
+    log_incident(&format!(
+        "[RULES] Built-in rules loaded: {}",
+        rules.len()
+    ));
 
-        if seen_ids.insert(id) {
-            rules.push(rule);
-        }
-    }
-
-    let custom_dir =
-        Path::new(CUSTOM_RULES_DIR);
-
-    let custom =
-        load_rules_from_directory(custom_dir);
-
-    for rule in custom {
-        let id = rule.id.trim().to_lowercase();
-
-        if seen_ids.insert(id) {
-            rules.push(rule);
-        } else {
-            log_incident(&format!(
-                "[RULES] Duplicate rule ignored: {}",
-                rule.id
-            ));
-        }
-    }
-
-    if rules.is_empty() {
-        log_incident(
-            "[RULES] No external rules loaded. Using fallback rule."
-        );
-
-        rules = get_hardcoded_default_rules();
-    }
-
-    rules.sort_by(|a, b| {
-        b.priority.cmp(&a.priority)
-    });
+    check_custom_rules();
 
     log_incident(&format!(
         "[RULES] Total active rules: {}",
@@ -447,9 +323,13 @@ fn load_all_rules() -> Vec<Rule> {
     rules
 }
 
+/* ============================================================
+   MATCHING ENGINE
+============================================================ */
+
 fn contains_case_insensitive(
     text: &str,
-    pattern: &str,
+    pattern: &str
 ) -> bool {
     text.to_lowercase()
         .contains(&pattern.to_lowercase())
@@ -457,129 +337,67 @@ fn contains_case_insensitive(
 
 fn calculate_match_score(
     rule: &Rule,
-    incident: &str,
-) -> Option<i32> {
-    let mut error_matches: usize = 0;
-    let mut context_matches: usize = 0;
+    incident: &str
+) -> i32 {
+    let mut score = 0;
 
     for pattern in &rule.error_patterns {
         if contains_case_insensitive(
             incident,
-            pattern,
+            pattern
         ) {
-            error_matches += 1;
+            score += 50;
         }
-    }
-
-    if error_matches == 0 {
-        return None;
     }
 
     for pattern in &rule.context_patterns {
         if contains_case_insensitive(
             incident,
-            pattern,
+            pattern
         ) {
-            context_matches += 1;
+            score += 20;
         }
     }
 
-    let error_score =
-        60i32
-            + (error_matches
-                .saturating_sub(1) as i32
-                * 10);
+    score += rule.priority;
 
-    let context_score =
-        context_matches as i32 * 10;
-
-    let priority_score =
-        rule.priority.clamp(-20, 20);
-
-    Some(
-        (error_score
-            + context_score
-            + priority_score)
-            .clamp(0, 100)
-    )
+    score
 }
 
 fn find_best_rule<'a>(
     rules: &'a [Rule],
-    incident: &str,
+    incident: &str
 ) -> Option<(&'a Rule, i32)> {
-    let mut best:
-        Option<(&'a Rule, i32)> = None;
+    let mut best_rule = None;
+    let mut best_score = 0;
 
     for rule in rules {
-        let score =
-            match calculate_match_score(
-                rule,
-                incident,
-            ) {
-                Some(score) => score,
-                None => continue,
-            };
+        let score = calculate_match_score(
+            rule,
+            incident
+        );
 
-        if score < MIN_MATCH_SCORE {
-            continue;
-        }
-
-        match best {
-            None => {
-                best = Some((rule, score));
-            }
-
-            Some((current_rule, current_score)) => {
-                if score > current_score
-                    || (
-                        score == current_score
-                            && rule.id.to_lowercase()
-                                < current_rule.id.to_lowercase()
-                    )
-                {
-                    best = Some((rule, score));
-                }
-            }
+        if score >= MIN_MATCH_SCORE
+            && score > best_score
+        {
+            best_score = score;
+            best_rule = Some(rule);
         }
     }
 
-    best
-}
-
-fn find_binary<'a>(
-    candidates: &'a [&'a str],
-) -> Result<&'a str, String> {
-    for candidate in candidates {
-        if Path::new(candidate).exists() {
-            return Ok(candidate);
-        }
-    }
-
-    Err(format!(
-        "Required binary not found. Checked: {}",
-        candidates.join(", ")
+    best_rule.map(|rule| (
+        rule,
+        best_score
     ))
 }
 
-fn systemctl_binary() -> Result<&'static str, String> {
-    find_binary(&[
-        "/usr/bin/systemctl",
-        "/bin/systemctl",
-    ])
-}
-
-fn docker_binary() -> Result<&'static str, String> {
-    find_binary(&[
-        "/usr/bin/docker",
-        "/bin/docker",
-        "/usr/local/bin/docker",
-    ])
-}
+/* ============================================================
+   COMMAND EXECUTION
+============================================================ */
 
 fn execute_command(
     executable: &str,
-    args: &[&str],
+    args: &[&str]
 ) -> Result<(), String> {
     log_incident(&format!(
         "[EXEC] {} {}",
@@ -587,17 +405,32 @@ fn execute_command(
         args.join(" ")
     ));
 
-    let mut child =
-        Command::new(executable)
-            .args(args)
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "Failed to start {}: {}",
-                    executable,
-                    e
-                )
-            })?;
+    let (program, program_args): (
+        &str,
+        Vec<&str>
+    ) = if executable == "systemctl" {
+        let mut sudo_args =
+            Vec::with_capacity(
+                args.len() + 1
+            );
+
+        sudo_args.push("/bin/systemctl");
+
+        sudo_args.extend_from_slice(args);
+
+        ("sudo", sudo_args)
+    } else {
+        (executable, args.to_vec())
+    };
+
+    let mut child = Command::new(program)
+        .args(&program_args)
+        .spawn()
+        .map_err(|e| format!(
+            "Failed to start {}: {}",
+            executable,
+            e
+        ))?;
 
     let start = Instant::now();
 
@@ -617,12 +450,11 @@ fn execute_command(
 
             Ok(None) => {
                 if start.elapsed()
-                    >= Duration::from_secs(
-                        COMMAND_TIMEOUT_SECS,
+                    > Duration::from_secs(
+                        COMMAND_TIMEOUT_SECS
                     )
                 {
                     let _ = child.kill();
-                    let _ = child.wait();
 
                     return Err(format!(
                         "{} timed out after {} seconds",
@@ -631,7 +463,9 @@ fn execute_command(
                     ));
                 }
 
-                sleep(Duration::from_millis(100));
+                sleep(
+                    Duration::from_millis(200)
+                );
             }
 
             Err(e) => {
@@ -645,26 +479,23 @@ fn execute_command(
     }
 }
 
+/* ============================================================
+   REMEDIATION
+============================================================ */
+
 fn perform_remediation(
-    remediation: &Remediation,
+    remediation: &Remediation
 ) -> Result<(), String> {
     match remediation {
         Remediation::ServiceRestart { service } => {
-            let normalized =
-                service
-                    .trim()
-                    .trim_end_matches(".service")
-                    .to_lowercase();
-
-            if normalized == SELF_SERVICE {
+            if service == SELF_SERVICE
+                || service == "aegira"
+            {
                 return Err(
                     "Refusing remediation: rule attempts to restart Aegira itself"
-                        .to_string(),
+                        .to_string()
                 );
             }
-
-            let systemctl =
-                systemctl_binary()?;
 
             log_incident(&format!(
                 "[RECOVERY] Restarting service: {}",
@@ -672,85 +503,63 @@ fn perform_remediation(
             ));
 
             execute_command(
-                systemctl,
-                &["restart", service.trim()],
+                "systemctl",
+                &["restart", service]
             )
         }
 
         Remediation::ContainerRestart { container } => {
-            let docker =
-                docker_binary()?;
-
             log_incident(&format!(
                 "[RECOVERY] Restarting container: {}",
                 container
             ));
 
             execute_command(
-                docker,
-                &["restart", container.trim()],
+                "docker",
+                &["restart", container]
             )
         }
     }
 }
 
+/* ============================================================
+   VERIFICATION
+============================================================ */
+
 fn verify_recovery(
-    verification: &Verification,
+    verification: &Verification
 ) -> bool {
     match verification {
-        Verification::None => {
-            log_incident(
-                "[VERIFY] No verification required",
-            );
-
-            true
-        }
-
         Verification::ServiceActive { service } => {
-            let systemctl =
-                match systemctl_binary() {
-                    Ok(path) => path,
-
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[VERIFY ERROR] {}",
-                                e
-                            )
-                        );
-
-                        return false;
-                    }
-                };
-
             log_incident(&format!(
                 "[VERIFY] Checking service: {}",
                 service
             ));
 
-            match Command::new(systemctl)
+            match Command::new("sudo")
+                .arg("/bin/systemctl")
                 .args([
                     "is-active",
-                    service.trim(),
+                    service
                 ])
                 .output()
             {
                 Ok(output) => {
                     let active =
                         output.status.success()
-                            && String::from_utf8_lossy(
-                                &output.stdout,
-                            )
-                            .trim()
-                            == "active";
+                        && String::from_utf8_lossy(
+                            &output.stdout
+                        )
+                        .trim()
+                        == "active";
 
                     if active {
                         log_incident(
-                            "[VERIFY] Service is active",
+                            "[VERIFY] Service is active"
                         );
                     } else {
                         log_incident(
-                            "[VERIFY] Service is NOT active",
+                            "[VERIFY] Service is NOT active"
                         );
                     }
 
@@ -758,12 +567,10 @@ fn verify_recovery(
                 }
 
                 Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[VERIFY ERROR] {}",
-                            e
-                        )
-                    );
+                    log_incident(&format!(
+                        "[VERIFY ERROR] {}",
+                        e
+                    ));
 
                     false
                 }
@@ -771,52 +578,36 @@ fn verify_recovery(
         }
 
         Verification::ContainerRunning { container } => {
-            let docker =
-                match docker_binary() {
-                    Ok(path) => path,
-
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[VERIFY ERROR] {}",
-                                e
-                            )
-                        );
-
-                        return false;
-                    }
-                };
-
             log_incident(&format!(
                 "[VERIFY] Checking container: {}",
                 container
             ));
 
-            match Command::new(docker)
+            match Command::new("docker")
                 .args([
                     "inspect",
                     "-f",
                     "{{.State.Running}}",
-                    container.trim(),
+                    container
                 ])
                 .output()
             {
                 Ok(output) => {
                     let running =
                         output.status.success()
-                            && String::from_utf8_lossy(
-                                &output.stdout,
-                            )
-                            .trim()
-                            == "true";
+                        && String::from_utf8_lossy(
+                            &output.stdout
+                        )
+                        .trim()
+                        == "true";
 
                     if running {
                         log_incident(
-                            "[VERIFY] Container is running",
+                            "[VERIFY] Container is running"
                         );
                     } else {
                         log_incident(
-                            "[VERIFY] Container is NOT running",
+                            "[VERIFY] Container is NOT running"
                         );
                     }
 
@@ -824,12 +615,10 @@ fn verify_recovery(
                 }
 
                 Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[VERIFY ERROR] {}",
-                            e
-                        )
-                    );
+                    log_incident(&format!(
+                        "[VERIFY ERROR] {}",
+                        e
+                    ));
 
                     false
                 }
@@ -838,8 +627,12 @@ fn verify_recovery(
     }
 }
 
+/* ============================================================
+   RECOVERY ENGINE
+============================================================ */
+
 fn recover_with_rule(
-    rule: &Rule,
+    rule: &Rule
 ) -> Result<(), String> {
     log_incident(&format!(
         "[MATCH] Rule: {}",
@@ -852,72 +645,44 @@ fn recover_with_rule(
     ));
 
     perform_remediation(
-        &rule.remediation,
+        &rule.remediation
     )?;
 
-    sleep(Duration::from_secs(
-        VERIFY_DELAY_SECS,
-    ));
+    sleep(
+        Duration::from_secs(2)
+    );
 
-    for attempt in 1..=MAX_VERIFY_ATTEMPTS {
+    for attempt in 1..=5 {
         log_incident(&format!(
-            "[VERIFY] Verification attempt {}/{}",
-            attempt,
-            MAX_VERIFY_ATTEMPTS
+            "[VERIFY] Verification attempt {}/5",
+            attempt
         ));
 
         if verify_recovery(
-            &rule.verification,
+            &rule.verification
         ) {
             return Ok(());
         }
 
-        if attempt < MAX_VERIFY_ATTEMPTS {
-            sleep(Duration::from_secs(
-                VERIFY_DELAY_SECS,
-            ));
-        }
+        sleep(
+            Duration::from_secs(2)
+        );
     }
 
     Err(
         "Remediation executed but health verification failed"
-            .to_string(),
+            .to_string()
     )
 }
 
-fn make_incident_key(
-    rule: &Rule,
-    incident: &str,
-) -> String {
-    format!(
-        "{}:{}",
-        rule.id.to_lowercase(),
-        incident.to_lowercase()
-    )
-}
-
-fn cleanup_cooldowns(
-    cooldowns: &mut HashMap<String, Instant>,
-) {
-    let cooldown =
-        Duration::from_secs(
-            INCIDENT_COOLDOWN_SECS,
-        );
-
-    cooldowns.retain(
-        |_, timestamp| {
-            timestamp.elapsed() < cooldown
-        },
-    );
-}
+/* ============================================================
+   INCIDENT PROCESSING
+============================================================ */
 
 fn process_incident(
     rules: &[Rule],
-    incident: &str,
-    cooldowns: &mut HashMap<String, Instant>,
+    incident: &str
 ) {
-    cleanup_cooldowns(cooldowns);
-
     let start = Instant::now();
 
     log_incident(&format!(
@@ -925,50 +690,30 @@ fn process_incident(
         incident
     ));
 
-    let (rule, score) =
-        match find_best_rule(
-            rules,
-            incident,
-        ) {
-            Some(result) => result,
-
-            None => {
-                log_incident(
-                    "[MATCH] No known remediation rule found",
-                );
-
-                log_incident(
-                    "[MANUAL ACTION] Unknown incident requires investigation",
-                );
-
-                return;
-            }
-        };
-
-    let key =
-        make_incident_key(
-            rule,
-            incident,
-        );
-
-    if cooldowns.contains_key(&key) {
-        log_incident(&format!(
-            "[COOLDOWN] Duplicate incident skipped for rule '{}'",
-            rule.id
-        ));
-
-        return;
-    }
-
-    cooldowns.insert(
-        key,
-        Instant::now(),
+    log_incident(
+        "================ INCIDENT ================"
     );
 
-    log_incident(&format!(
-        "[MATCH] Rule: {}",
-        rule.name
-    ));
+    log_incident(incident);
+
+    let (rule, score) = match find_best_rule(
+        rules,
+        incident
+    ) {
+        Some(result) => result,
+
+        None => {
+            log_incident(
+                "[MATCH] No known remediation rule found"
+            );
+
+            log_incident(
+                "[MANUAL ACTION] Unknown incident requires investigation"
+            );
+
+            return;
+        }
+    };
 
     log_incident(&format!(
         "[MATCH] Confidence score: {}",
@@ -997,65 +742,33 @@ fn process_incident(
     }
 }
 
-#[cfg(unix)]
-fn get_file_identity(
-    path: &Path,
-) -> Result<FileIdentity, String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata =
-        fs::metadata(path)
-            .map_err(|e| {
-                format!(
-                    "Failed to read metadata for {}: {}",
-                    path.display(),
-                    e
-                )
-            })?;
-
-    Ok(FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-fn get_file_identity(
-    path: &Path,
-) -> Result<FileIdentity, String> {
-    let metadata =
-        fs::metadata(path)
-            .map_err(|e| {
-                format!(
-                    "Failed to read metadata for {}: {}",
-                    path.display(),
-                    e
-                )
-            })?;
-
-    Ok(FileIdentity {
-        device: 0,
-        inode: metadata.len(),
-    })
-}
+/* ============================================================
+   MAIN
+============================================================ */
 
 fn main() {
-    if let Err(e) =
-        ensure_environment_setup()
-    {
-        eprintln!(
-            "[FATAL] Environment setup failed: {}",
-            e
-        );
+    let aegira_dir = get_aegira_dir();
 
-        return;
-    }
+    let _ = fs::create_dir_all(
+        aegira_dir.join("logs")
+    );
 
-    let aegira_dir =
-        get_aegira_dir();
+    let _ = fs::create_dir_all(
+        aegira_dir.join("rules/builtin")
+    );
+
+    let _ = fs::create_dir_all(
+        aegira_dir.join("rules/custom")
+    );
+
+    let log_file_path = get_log_file_path();
 
     log_incident(
-        "[INFO] Aegira Recovery Engine Started",
+        "[INFO] Aegira Free Recovery Engine Started"
+    );
+
+    log_incident(
+        "[INFO] Mode: FREE"
     );
 
     log_incident(&format!(
@@ -1065,197 +778,135 @@ fn main() {
 
     log_incident(&format!(
         "[INFO] Monitoring log: {}",
-        LOG_FILE_PATH
+        log_file_path.display()
     ));
 
-    let mut rules =
-        load_all_rules();
+    let rules = load_all_rules();
 
-    log_incident(&format!(
-        "[INFO] {} remediation rules ready",
-        rules.len()
-    ));
+    if rules.is_empty() {
+        log_incident(
+            "[WARNING] No remediation rules loaded"
+        );
+    } else {
+        log_incident(&format!(
+            "[INFO] {} remediation rules ready",
+            rules.len()
+        ));
+    }
 
-    let mut last_rule_reload =
-        Instant::now();
+    let file = match File::open(
+        &log_file_path
+    ) {
+        Ok(file) => file,
 
-    let log_path =
-        Path::new(LOG_FILE_PATH);
+        Err(e) => {
+            log_incident(&format!(
+                "[FATAL] Failed to open monitored log {}: {}",
+                log_file_path.display(),
+                e
+            ));
 
-    let mut position =
-        match fs::metadata(log_path) {
-            Ok(metadata) => metadata.len(),
+            return;
+        }
+    };
 
-            Err(e) => {
-                log_incident(
-                    &format!(
-                        "[FATAL] Failed to inspect monitored log: {}",
-                        e
-                    )
-                );
+    let mut reader = BufReader::new(file);
 
-                return;
-            }
-        };
+    let mut position = match reader.seek(
+        SeekFrom::End(0)
+    ) {
+        Ok(position) => position,
 
-    let mut file_identity =
-        match get_file_identity(log_path) {
-            Ok(identity) => identity,
+        Err(e) => {
+            log_incident(&format!(
+                "[FATAL] Failed to seek log: {}",
+                e
+            ));
 
-            Err(e) => {
-                log_incident(
-                    &format!(
-                        "[FATAL] {}",
-                        e
-                    )
-                );
-
-                return;
-            }
-        };
-
-    let mut cooldowns:
-        HashMap<String, Instant> =
-        HashMap::new();
+            return;
+        }
+    };
 
     log_incident(
-        "[INFO] Monitoring new log entries...",
+        "[INFO] Monitoring new log entries..."
     );
 
     loop {
-        if last_rule_reload.elapsed()
-            >= Duration::from_secs(
-                RULE_RELOAD_INTERVAL_SECS,
-            )
-        {
-            rules =
-                load_all_rules();
+        let metadata = match fs::metadata(
+            &log_file_path
+        ) {
+            Ok(metadata) => metadata,
 
-            last_rule_reload =
-                Instant::now();
+            Err(e) => {
+                log_incident(&format!(
+                    "[ERROR] Failed to stat log: {}",
+                    e
+                ));
 
-            log_incident(&format!(
-                "[RULES] Rules reloaded: {} active",
-                rules.len()
-            ));
-        }
+                sleep(
+                    Duration::from_secs(
+                        POLL_INTERVAL_SECS
+                    )
+                );
 
-        let metadata =
-            match fs::metadata(log_path) {
-                Ok(metadata) => metadata,
+                continue;
+            }
+        };
 
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] Failed to stat monitored log: {}",
-                            e
-                        )
-                    );
+        let file_size = metadata.len();
 
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
-
-                    continue;
-                }
-            };
-
-        let current_identity =
-            match get_file_identity(log_path) {
-                Ok(identity) => identity,
-
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] {}",
-                            e
-                        )
-                    );
-
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
-
-                    continue;
-                }
-            };
-
-        let file_size =
-            metadata.len();
-
-        if current_identity
-            != file_identity
-        {
+        if file_size < position {
             log_incident(
-                "[INFO] Log rotation detected. Resetting position.",
-            );
-
-            file_identity =
-                current_identity;
-
-            position = 0;
-        } else if file_size < position {
-            log_incident(
-                "[INFO] Log truncation detected. Resetting position.",
+                "[INFO] Log rotation/truncation detected"
             );
 
             position = 0;
         }
 
-        if file_size <= position {
+        if file_size == position {
             sleep(
                 Duration::from_secs(
-                    POLL_INTERVAL_SECS,
+                    POLL_INTERVAL_SECS
                 )
             );
 
             continue;
         }
 
-        let file =
-            match File::open(log_path) {
-                Ok(file) => file,
+        let file = match File::open(
+            &log_file_path
+        ) {
+            Ok(file) => file,
 
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] Failed opening monitored log: {}",
-                            e
-                        )
-                    );
-
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
-
-                    continue;
-                }
-            };
-
-        let mut reader =
-            BufReader::new(file);
-
-        if let Err(e) =
-            reader.seek(
-                SeekFrom::Start(position)
-            )
-        {
-            log_incident(
-                &format!(
-                    "[LOG ERROR] Failed seeking monitored log: {}",
+            Err(e) => {
+                log_incident(&format!(
+                    "[ERROR] Failed to open log: {}",
                     e
-                )
-            );
+                ));
+
+                sleep(
+                    Duration::from_secs(
+                        POLL_INTERVAL_SECS
+                    )
+                );
+
+                continue;
+            }
+        };
+
+        let mut reader = BufReader::new(file);
+
+        if let Err(e) = reader.seek(
+            SeekFrom::Start(position)
+        ) {
+            log_incident(&format!(
+                "[ERROR] Failed to seek log: {}",
+                e
+            ));
 
             sleep(
                 Duration::from_secs(
-                    POLL_INTERVAL_SECS,
+                    POLL_INTERVAL_SECS
                 )
             );
 
@@ -1263,65 +914,46 @@ fn main() {
         }
 
         loop {
-            let line_start =
-                position;
+            let mut line = String::new();
 
-            let mut line =
-                String::new();
+            let bytes_read = match reader.read_line(
+                &mut line
+            ) {
+                Ok(bytes) => bytes,
 
-            let bytes_read =
-                match reader.read_line(
-                    &mut line,
-                ) {
-                    Ok(bytes) => bytes,
+                Err(e) => {
+                    log_incident(&format!(
+                        "[ERROR] Failed reading log: {}",
+                        e
+                    ));
 
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[LOG ERROR] Failed reading monitored log: {}",
-                                e
-                            )
-                        );
-
-                        break;
-                    }
-                };
+                    break;
+                }
+            };
 
             if bytes_read == 0 {
                 break;
             }
 
-            /*
-             * If the writer has not finished the line yet,
-             * do not advance position. The next polling cycle
-             * will reread the incomplete line.
-             */
-            if !line.ends_with('\n') {
-                position = line_start;
-                break;
-            }
+            position += bytes_read as u64;
 
-            position =
-                line_start
-                    + bytes_read as u64;
+            let trimmed = line.trim();
 
-            let trimmed =
-                line.trim();
-
-            if trimmed.contains("[ERROR]")
-                || trimmed.contains("[CRITICAL]")
+            if !trimmed.contains("[ERROR]")
+                && !trimmed.contains("[CRITICAL]")
             {
-                process_incident(
-                    &rules,
-                    trimmed,
-                    &mut cooldowns,
-                );
+                continue;
             }
+
+            process_incident(
+                &rules,
+                trimmed
+            );
         }
 
         sleep(
             Duration::from_secs(
-                POLL_INTERVAL_SECS,
+                POLL_INTERVAL_SECS
             )
         );
     }
